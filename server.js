@@ -2,13 +2,14 @@ const express = require("express");
 const session = require("express-session");
 const helmet = require("helmet");
 const Database = require("better-sqlite3");
-const bcrypt = require("bcryptjs");
 const QRCode = require("qrcode");
 const crypto = require("crypto");
 const path = require("path");
 
 const app = express();
-const db = new Database(process.env.DB_PATH || "/data/zambomba.sqlite");
+const DB_PATH = process.env.DB_PATH || "/data/zambomba.sqlite";
+require("fs").mkdirSync(path.dirname(DB_PATH), {recursive:true});
+const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 db.exec(`
 CREATE TABLE IF NOT EXISTS orders (
@@ -24,7 +25,7 @@ CREATE TABLE IF NOT EXISTS scans (token TEXT PRIMARY KEY, order_id TEXT NOT NULL
 
 const CAPACITY = Number(process.env.EVENT_CAPACITY || 500);
 const PRICE = Number(process.env.TICKET_PRICE_CENTS || 2500);
-const ADMIN_HASH = process.env.ADMIN_PASSWORD_HASH || "";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 const now = () => new Date().toISOString();
 const makeId = () => crypto.randomBytes(5).toString("hex").toUpperCase();
@@ -42,7 +43,7 @@ const event = () => ({
  artists: process.env.EVENT_ARTISTS || "Juan de la Morena · DJ Andrei · Sebastián",
  price: PRICE/100, capacity: CAPACITY, availability: totals().available
 });
-if (!ADMIN_HASH || !SESSION_SECRET) console.warn("Faltan ADMIN_PASSWORD_HASH o SESSION_SECRET: el panel admin permanecerá desactivado.");
+if (!ADMIN_PASSWORD || !SESSION_SECRET) console.warn("Faltan ADMIN_PASSWORD_HASH o SESSION_SECRET: el panel admin permanecerá desactivado.");
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: "30kb" }));
 app.use(session({
@@ -69,7 +70,7 @@ app.post("/api/orders",(req,res)=>{
 });
 app.post("/api/orders/:id/declare",(req,res)=>{const r=db.prepare("UPDATE orders SET status='declared',declared_at=? WHERE id=? AND status='pending'").run(now(),req.params.id);if(!r.changes)return res.status(400).json({error:"No se puede declarar este pedido."});res.json({ok:true,message:"Aviso recibido. El pago sigue pendiente de comprobación manual."})});
 const admin=(req,res,next)=>req.session.admin?next():res.status(401).json({error:"No autorizado"});
-app.post("/api/admin/login",(req,res)=>{if(!ADMIN_HASH)return res.status(503).json({error:"Panel sin configurar"});if(!bcrypt.compareSync(String(req.body.password||""),ADMIN_HASH))return res.status(401).json({error:"Contraseña incorrecta"});req.session.admin=true;res.json({ok:true})});
+app.post("/api/admin/login",(req,res)=>{if(!ADMIN_PASSWORD)return res.status(503).json({error:"Panel sin configurar"});const a=Buffer.from(String(req.body.password||""));const b=Buffer.from(ADMIN_PASSWORD);if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return res.status(401).json({error:"Contraseña incorrecta"});req.session.admin=true;res.json({ok:true})});
 app.get("/api/admin/summary",admin,(req,res)=>{const t=totals(),revenue=db.prepare("SELECT COALESCE(SUM(total_cents),0) n FROM orders WHERE status='confirmed'").get().n;res.json({...t,capacity:CAPACITY,revenue:revenue/100})});
 app.get("/api/admin/orders",admin,(req,res)=>res.json(db.prepare("SELECT id,name,email,quantity,status,created_at FROM orders ORDER BY created_at DESC").all()));
 app.post("/api/admin/orders/:id/confirm",admin,(req,res)=>{const confirm=db.transaction(()=>{const o=db.prepare("SELECT * FROM orders WHERE id=?").get(req.params.id);if(!o||o.status!=="declared")throw Error("Pedido no pendiente.");const online=db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM orders WHERE status='confirmed'").get().n,manual=db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM manual_sales").get().n;if(o.quantity>CAPACITY-online-manual)throw Error("Aforo insuficiente.");const tokens=Array.from({length:o.quantity},()=>crypto.randomBytes(18).toString("hex"));db.prepare("UPDATE orders SET status='confirmed',confirmed_at=?,qr_tokens=? WHERE id=?").run(now(),JSON.stringify(tokens),o.id);return tokens;});try{const tokens=confirm();res.json({ok:true,tickets:tokens.map(t=>({token:t,qr:"/ticket/"+t}))})}catch(e){res.status(409).json({error:e.message})}});
