@@ -85,21 +85,22 @@ app.post("/api/admin/logout",(req,res)=>req.session.destroy(()=>res.json({ok:tru
 app.get("/api/admin/summary",admin,(req,res)=>{const t=totals(),revenue=db.prepare("SELECT COALESCE(SUM(total_cents),0) n FROM orders WHERE status='confirmed'").get().n;res.json({...t,capacity:CAPACITY,revenue:revenue/100})});
 app.get("/api/admin/orders",admin,(req,res)=>res.json(db.prepare("SELECT id,name,email,phone,quantity,total_cents,status,created_at,declared_at FROM orders ORDER BY created_at DESC").all()));
 async function sendTicketEmail(order,tokens){
- const user=process.env.GMAIL_USER||"flamencazambomba@gmail.com";
- const appPassword=process.env.GMAIL_APP_PASSWORD;
- if(!appPassword)throw Error("Falta configurar GMAIL_APP_PASSWORD en Railway. No se ha confirmado el pedido.");
- const transporter=require("nodemailer").createTransport({service:"gmail",auth:{user,pass:appPassword}});
+ const apiKey=process.env.BREVO_API_KEY;
+ const sender=process.env.BREVO_SENDER_EMAIL;
+ if(!apiKey||!sender)throw Error("Falta configurar BREVO_API_KEY y BREVO_SENDER_EMAIL en Railway. No se ha confirmado el pedido.");
  const base=(process.env.PUBLIC_URL||"https://zambomba-web-production.up.railway.app").replace(/\\/$/,"");
  const attachments=[];
  const ticketLinks=[];
  for(let i=0;i<tokens.length;i++){
   const url=base+"/check/"+tokens[i];
   const png=await QRCode.toBuffer(url,{type:"png",width:600,margin:2});
-  attachments.push({filename:"entrada-"+(i+1)+"-"+order.id+".png",content:png,contentType:"image/png"});
+  attachments.push({name:"entrada-"+(i+1)+"-"+order.id+".png",content:png.toString("base64")});
   ticketLinks.push("<li><b>Entrada "+(i+1)+"</b>: <a href=\\""+url+"\\">Ver entrada y QR</a> — QR adjunto a este correo</li>");
  }
- const html="<div style=\\"font-family:Arial,sans-serif;color:#241b18;max-width:620px;margin:auto\\"><h1 style=\\"color:#8b442b\\">¡Tu entrada está aquí!</h1><p>Hola "+escapeHtml(order.name)+",</p><p>Hemos confirmado tu pago para <b>Zambomba Flamenca Ronda</b>.</p><p><b>12 de diciembre de 2026 · 17:00</b><br>Antiguos Abades, Ronda</p><p>Referencia: <b>"+order.id+"</b><br>Entradas: <b>"+order.quantity+"</b></p><p>Cada entrada tiene un QR diferente. Presenta un QR por persona en el acceso. No compartas ni reutilices los códigos.</p><ul>"+ticketLinks.join("")+"</ul><p>También encontrarás cada QR como imagen PNG adjunta.</p><p>¡Gracias y nos vemos en la Zambomba!</p></div>";
- return await transporter.sendMail({from:"Zambomba Flamenca <"+user+">",to:order.email,subject:"Tus entradas · Zambomba Flamenca Ronda",html,attachments});
+ const htmlContent="<div style=\\"font-family:Arial,sans-serif;color:#241b18;max-width:620px;margin:auto\\"><h1 style=\\"color:#8b442b\\">¡Tu entrada está aquí!</h1><p>Hola "+escapeHtml(order.name)+",</p><p>Hemos confirmado tu pago para <b>Zambomba Flamenca Ronda</b>.</p><p><b>12 de diciembre de 2026 · 17:00</b><br>Antiguos Abades, Ronda</p><p>Referencia: <b>"+order.id+"</b><br>Entradas: <b>"+order.quantity+"</b></p><p>Cada entrada tiene un QR diferente. Presenta un QR por persona en el acceso. No compartas ni reutilices los códigos.</p><ul>"+ticketLinks.join("")+"</ul><p>También encontrarás cada QR como imagen PNG adjunta.</p><p>¡Gracias y nos vemos en la Zambomba!</p></div>";
+ const response=await fetch("https://api.brevo.com/v3/smtp/email",{method:"POST",headers:{"api-key":apiKey,"accept":"application/json","content-type":"application/json"},body:JSON.stringify({sender:{name:"Zambomba Flamenca",email:sender},to:[{email:order.email,name:order.name}],subject:"Tus entradas · Zambomba Flamenca Ronda",htmlContent,attachment:attachments})});
+ if(!response.ok){const detail=await response.text();throw Error("Brevo no pudo enviar el correo: "+detail.slice(0,300));}
+ return await response.json();
 }
 function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));}
 app.post("/api/admin/orders/:id/confirm",admin,async(req,res)=>{
