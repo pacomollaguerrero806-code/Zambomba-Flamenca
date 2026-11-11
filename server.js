@@ -88,7 +88,7 @@ async function sendTicketEmail(order,tokens){
  const apiKey=process.env.BREVO_API_KEY;
  const sender=process.env.BREVO_SENDER_EMAIL;
  if(!apiKey||!sender)throw Error("Falta configurar BREVO_API_KEY y BREVO_SENDER_EMAIL en Railway. No se ha confirmado el pedido.");
-  const base=(process.env.PUBLIC_URL||"https://zambomba-web-production.up.railway.app").replace(/\/$/,"");
+   const base=(process.env.PUBLIC_URL||"https://zambomba-web-production.up.railway.app").replace(/\/+$/,"");
  const attachments=[];
  const ticketLinks=[];
  for(let i=0;i<tokens.length;i++){
