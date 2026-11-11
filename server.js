@@ -97,7 +97,7 @@ async function sendTicketEmail(order,tokens){
   ticketLinks.push("<li><b>Entrada "+(i+1)+"</b>: <a href=\\""+url+"\\">Ver entrada y QR</a> — QR adjunto a este correo</li>");
  }
  const html="<div style=\\"font-family:Arial,sans-serif;color:#241b18;max-width:620px;margin:auto\\"><h1 style=\\"color:#8b442b\\">¡Tu entrada está aquí!</h1><p>Hola "+escapeHtml(order.name)+",</p><p>Hemos confirmado tu pago para <b>Zambomba Flamenca Ronda</b>.</p><p><b>12 de diciembre de 2026 · 17:00</b><br>Antiguos Abades, Ronda</p><p>Referencia: <b>"+order.id+"</b><br>Entradas: <b>"+order.quantity+"</b></p><p>Cada entrada tiene un QR diferente. Presenta un QR por persona en el acceso. No compartas ni reutilices los códigos.</p><ul>"+ticketLinks.join("")+"</ul><p>También encontrarás cada QR como imagen PNG adjunta.</p><p>¡Gracias y nos vemos en la Zambomba!</p></div>";
- const response=await fetch("https://api.resend.com/emails",{method:"POST",headers:{"Authorization":"Bearer "+apiKey,"Content-Type":"application/json"},body:JSON.stringify({from,to:[order.email],subject:"Tus entradas · Zambomba Flamenca Ronda",html,attachments})});
+ const response=await fetch("https://api.resend.com/emails",{method:"POST",headers:{"Authorization":"Bearer "+apiKey,"Content-Type":"application/json"},body:JSON.stringify({from,to:[order.email],replyTo:process.env.REPLY_TO_EMAIL||undefined,subject:"Tus entradas · Zambomba Flamenca Ronda",html,attachments})});
  if(!response.ok){const detail=await response.text();throw Error("No se pudo enviar el correo de entradas: "+detail.slice(0,300));}
  return await response.json();
 }
