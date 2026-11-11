@@ -84,10 +84,52 @@ app.get("/api/admin/me",(req,res)=>res.json({ok:!!(req.session&&req.session.admi
 app.post("/api/admin/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
 app.get("/api/admin/summary",admin,(req,res)=>{const t=totals(),revenue=db.prepare("SELECT COALESCE(SUM(total_cents),0) n FROM orders WHERE status='confirmed'").get().n;res.json({...t,capacity:CAPACITY,revenue:revenue/100})});
 app.get("/api/admin/orders",admin,(req,res)=>res.json(db.prepare("SELECT id,name,email,phone,quantity,total_cents,status,created_at,declared_at FROM orders ORDER BY created_at DESC").all()));
-app.post("/api/admin/orders/:id/confirm",admin,(req,res)=>{const confirm=db.transaction(()=>{const o=db.prepare("SELECT * FROM orders WHERE id=?").get(req.params.id);if(!o||o.status!=="declared")throw Error("Pedido no pendiente.");const online=db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM orders WHERE status='confirmed'").get().n,manual=db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM manual_sales").get().n;if(o.quantity>CAPACITY-online-manual)throw Error("Aforo insuficiente.");const tokens=Array.from({length:o.quantity},()=>crypto.randomBytes(18).toString("hex"));db.prepare("UPDATE orders SET status='confirmed',confirmed_at=?,qr_tokens=? WHERE id=?").run(now(),JSON.stringify(tokens),o.id);return tokens;});try{const tokens=confirm();res.json({ok:true,tickets:tokens.map(t=>({token:t,qr:"/ticket/"+t}))})}catch(e){res.status(409).json({error:e.message})}});
+async function sendTicketEmail(order,tokens){
+ const apiKey=process.env.RESEND_API_KEY, from=process.env.TICKETS_FROM_EMAIL;
+ if(!apiKey||!from)throw Error("Falta configurar RESEND_API_KEY y TICKETS_FROM_EMAIL en Railway. No se ha confirmado el pedido.");
+ const base=(process.env.PUBLIC_URL||"https://zambomba-web-production.up.railway.app").replace(/\\/$/,"");
+ const attachments=[];
+ const ticketLinks=[];
+ for(let i=0;i<tokens.length;i++){
+  const url=base+"/check/"+tokens[i];
+  const png=await QRCode.toBuffer(url,{type:"png",width:600,margin:2});
+  attachments.push({filename:"entrada-"+(i+1)+"-"+order.id+".png",content:png.toString("base64")});
+  ticketLinks.push("<li><b>Entrada "+(i+1)+"</b>: <a href=\\""+url+"\\">Ver entrada y QR</a> — QR adjunto a este correo</li>");
+ }
+ const html="<div style=\\"font-family:Arial,sans-serif;color:#241b18;max-width:620px;margin:auto\\"><h1 style=\\"color:#8b442b\\">¡Tu entrada está aquí!</h1><p>Hola "+escapeHtml(order.name)+",</p><p>Hemos confirmado tu pago para <b>Zambomba Flamenca Ronda</b>.</p><p><b>12 de diciembre de 2026 · 17:00</b><br>Antiguos Abades, Ronda</p><p>Referencia: <b>"+order.id+"</b><br>Entradas: <b>"+order.quantity+"</b></p><p>Cada entrada tiene un QR diferente. Presenta un QR por persona en el acceso. No compartas ni reutilices los códigos.</p><ul>"+ticketLinks.join("")+"</ul><p>También encontrarás cada QR como imagen PNG adjunta.</p><p>¡Gracias y nos vemos en la Zambomba!</p></div>";
+ const response=await fetch("https://api.resend.com/emails",{method:"POST",headers:{"Authorization":"Bearer "+apiKey,"Content-Type":"application/json"},body:JSON.stringify({from,to:[order.email],subject:"Tus entradas · Zambomba Flamenca Ronda",html,attachments})});
+ if(!response.ok){const detail=await response.text();throw Error("No se pudo enviar el correo de entradas: "+detail.slice(0,300));}
+ return await response.json();
+}
+function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));}
+app.post("/api/admin/orders/:id/confirm",admin,async(req,res)=>{
+ try{
+  const order=db.prepare("SELECT * FROM orders WHERE id=?").get(req.params.id);
+  if(!order||order.status!=="declared")return res.status(409).json({error:"Pedido no pendiente."});
+  const online=db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM orders WHERE status='confirmed'").get().n,manual=db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM manual_sales").get().n;
+  if(order.quantity>CAPACITY-online-manual)return res.status(409).json({error:"Aforo insuficiente."});
+  const tokens=Array.from({length:order.quantity},()=>crypto.randomBytes(24).toString("hex"));
+  const emailResult=await sendTicketEmail(order,tokens);
+  const update=db.prepare("UPDATE orders SET status='confirmed',confirmed_at=?,qr_tokens=? WHERE id=? AND status='declared'").run(now(),JSON.stringify(tokens),order.id);
+  if(!update.changes)return res.status(409).json({error:"El pedido cambió mientras se enviaba el correo. Contacta con soporte antes de volver a confirmar."});
+  res.json({ok:true,emailId:emailResult.id,tickets:tokens.map((t,i)=>({number:i+1,token:t,qr:"/ticket/"+t,checkUrl:"/check/"+t}))});
+ }catch(e){res.status(502).json({error:e.message})}
+});
 app.post("/api/admin/orders/:id/reject",admin,(req,res)=>{const r=db.prepare("UPDATE orders SET status='rejected' WHERE id=? AND status='declared'").run(req.params.id);if(!r.changes)return res.status(400).json({error:"No se puede rechazar."});res.json({ok:true})});
 app.get("/ticket/:token",async(req,res)=>{const o=db.prepare("SELECT * FROM orders WHERE status='confirmed'").all().find(x=>(JSON.parse(x.qr_tokens||"[]")).includes(req.params.token));if(!o)return res.status(404).send("Entrada no válida.");const scan=db.prepare("SELECT token FROM scans WHERE token=?").get(req.params.token);if(scan)return res.status(409).send("Entrada ya utilizada.");const png=await QRCode.toDataURL(req.protocol+"://"+req.get("host")+"/check/"+req.params.token);res.type("html").send("<h1>Entrada Zambomba Flamenca Ronda</h1><p>"+o.name+"</p><img src='"+png+"' width='260'><p>Presenta este QR en el acceso.</p>")});
-app.get("/check/:token",(req,res)=>{const o=db.prepare("SELECT * FROM orders WHERE status='confirmed'").all().find(x=>(JSON.parse(x.qr_tokens||"[]")).includes(req.params.token));if(!o)return res.status(404).send("Entrada no válida.");res.type("html").send("<h1>QR reconocido</h1><p>La validación final debe realizarla el personal de acceso desde un dispositivo autorizado.</p>")});
+app.get("/check/:token",(req,res)=>{
+ const token=req.params.token;
+ const result=db.transaction(()=>{
+  const o=db.prepare("SELECT * FROM orders WHERE status='confirmed'").all().find(x=>(JSON.parse(x.qr_tokens||"[]")).includes(token));
+  if(!o)return {status:"invalid"};
+  if(db.prepare("SELECT token FROM scans WHERE token=?").get(token))return {status:"used",name:o.name};
+  db.prepare("INSERT INTO scans(token,order_id,scanned_at) VALUES(?,?,?)").run(token,o.id,now());
+  return {status:"valid",name:o.name,id:o.id};
+ })();
+ if(result.status==="invalid")return res.status(404).type("html").send("<h1>Entrada no válida</h1>");
+ if(result.status==="used")return res.status(409).type("html").send("<h1>⚠️ Entrada ya utilizada</h1><p>Esta entrada ya fue escaneada anteriormente.</p>");
+ res.type("html").send("<meta name='viewport' content='width=device-width,initial-scale=1'><main style='font:20px Arial;max-width:600px;margin:50px auto;text-align:center'><h1 style='color:green'>✓ Entrada válida</h1><p>"+escapeHtml(result.name)+"</p><p>Referencia: "+result.id+"</p><p>QR validado y marcado como utilizado.</p></main>");
+});
 app.get("/health",(req,res)=>res.json({ok:true}));
 const port=Number(process.env.PORT||3000);
 app.listen(port,"0.0.0.0",()=>console.log("Zambomba online en puerto "+port));
