@@ -1,0 +1,81 @@
+const express = require("express");
+const session = require("express-session");
+const helmet = require("helmet");
+const Database = require("better-sqlite3");
+const bcrypt = require("bcryptjs");
+const QRCode = require("qrcode");
+const crypto = require("crypto");
+const path = require("path");
+
+const app = express();
+const db = new Database(process.env.DB_PATH || "/data/zambomba.sqlite");
+db.pragma("journal_mode = WAL");
+db.exec(`
+CREATE TABLE IF NOT EXISTS orders (
+ id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT,
+ quantity INTEGER NOT NULL, total_cents INTEGER NOT NULL, status TEXT NOT NULL,
+ created_at TEXT NOT NULL, declared_at TEXT, confirmed_at TEXT, qr_tokens TEXT
+);
+CREATE TABLE IF NOT EXISTS manual_sales (
+ id TEXT PRIMARY KEY, quantity INTEGER NOT NULL, note TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scans (token TEXT PRIMARY KEY, order_id TEXT NOT NULL, scanned_at TEXT NOT NULL);
+`);
+
+const CAPACITY = Number(process.env.EVENT_CAPACITY || 500);
+const PRICE = Number(process.env.TICKET_PRICE_CENTS || 2500);
+const ADMIN_HASH = process.env.ADMIN_PASSWORD_HASH || "";
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+const now = () => new Date().toISOString();
+const makeId = () => crypto.randomBytes(5).toString("hex").toUpperCase();
+const totals = () => {
+ const soldOnline = db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM orders WHERE status='confirmed'").get().n;
+ const soldManual = db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM manual_sales").get().n;
+ const pending = db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM orders WHERE status IN ('pending','declared')").get().n;
+ return { sold: soldOnline + soldManual, pending, available: Math.max(0, CAPACITY-soldOnline-soldManual-pending) };
+};
+const event = () => ({
+ name: process.env.EVENT_NAME || "Zambomba Flamenca Ronda",
+ date: process.env.EVENT_DATE || "12 de diciembre de 2026",
+ time: process.env.EVENT_TIME || "17:00",
+ venue: process.env.EVENT_VENUE || "Antiguos Abades, Ronda",
+ artists: process.env.EVENT_ARTISTS || "Juan de la Morena · DJ Andrei · Sebastián",
+ price: PRICE/100, capacity: CAPACITY, availability: totals().available
+});
+if (!ADMIN_HASH || !SESSION_SECRET) console.warn("Faltan ADMIN_PASSWORD_HASH o SESSION_SECRET: el panel admin permanecerá desactivado.");
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: "30kb" }));
+app.use(session({
+ secret: SESSION_SECRET || "disabled-admin-session",
+ resave: false, saveUninitialized: false,
+ cookie: { httpOnly: true, sameSite: "lax", secure: "auto", maxAge: 8*60*60*1000 }
+}));
+app.get("/api/event", (req,res) => res.json(event()));
+app.get("/", (req,res) => res.type("html").send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Zambomba Flamenca Ronda</title><style>
+*{box-sizing:border-box}body{margin:0;background:#17110f;color:#fff4e8;font-family:system-ui,Arial}header{padding:24px 7%;background:linear-gradient(120deg,#24130f,#5b211c)}.tag{color:#e8bd7a;letter-spacing:3px;text-transform:uppercase;font-size:12px}h1{font-family:Georgia,serif;font-size:clamp(42px,8vw,76px);line-height:.98;margin:22px 0}main{max-width:980px;margin:auto;padding:35px 20px}.panel{background:#241b18;border:1px solid #674333;border-radius:18px;padding:24px;margin:18px 0}.gold{color:#e8bd7a}label{display:block;margin:12px 0 5px}input,select,button{font:inherit;padding:13px;border-radius:9px;border:1px solid #80604b;width:100%}input,select{background:#140f0d;color:white}button{background:#d5a45d;color:#21140d;font-weight:700;border:0;cursor:pointer;margin-top:14px}button:disabled{opacity:.5}small{color:#d7c5b7}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.price{font-size:32px;font-weight:bold}.hidden{display:none}a{color:#e8bd7a}</style></head><body><header><div class="tag">Ronda · 12 diciembre 2026</div><h1>Zambomba<br><span class="gold">Flamenca</span></h1><p>Una tarde para vivir el ambiente, el compás y la tradición.</p></header><main><section class="panel"><div class="tag">El evento</div><h2>${event().name}</h2><div class="grid"><p>📅 <b>${event().date}</b></p><p>🕔 <b>${event().time}</b></p><p>📍 <b>${event().venue}</b></p></div><p>Artistas: ${event().artists}</p><p class="price gold">${event().price.toFixed(2).replace(".",",")} € <small>/ entrada</small></p><p>Entradas disponibles: <b id="availability">${event().availability}</b> de ${event().capacity}</p></section><section class="panel"><h2>Reserva tus entradas</h2><p>Completa tus datos. La reserva queda pendiente hasta que la organización compruebe el Bizum.</p><form id="order"><label>Nombre y apellidos</label><input name="name" required maxlength="100"><label>Correo electrónico</label><input name="email" type="email" required><label>Teléfono (opcional)</label><input name="phone" type="tel"><label>Número de entradas</label><select name="quantity">${Array.from({length:10},(_,i)=>`<option value="${i+1}">${i+1}</option>`).join("")}</select><button>Continuar con la reserva</button></form><div id="result" class="hidden"></div></section><p><small>El envío del formulario no confirma el pago ni garantiza la entrada. La entrada QR solo se emite tras la verificación manual del pago por la organización.</small></p></main><script>
+const form=document.querySelector("#order"),result=document.querySelector("#result");
+form.addEventListener("submit",async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(form));data.quantity=Number(data.quantity);const b=form.querySelector("button");b.disabled=true;try{const r=await fetch("/api/orders",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});const d=await r.json();if(!r.ok)throw Error(d.error||"No se pudo crear la reserva");result.classList.remove("hidden");result.innerHTML="<h3>Reserva registrada: "+d.id+"</h3><p>Total: <b>"+d.total.toFixed(2)+" €</b></p><p>"+d.instructions+"</p><p><b>Referencia de pedido: "+d.id+"</b></p><button id='paid'>YA HE REALIZADO EL BIZUM</button><p><small>Este botón solo avisa a la organización. No verifica el pago ni genera entradas.</small></p>";document.querySelector("#paid").onclick=async()=>{const x=await fetch("/api/orders/"+d.id+"/declare",{method:"POST"});const y=await x.json();alert(y.message||y.error)};form.reset();}catch(err){alert(err.message)}finally{b.disabled=false}});
+</script></body></html>`));
+app.get("/admin", (req,res) => res.type("html").send(`<!doctype html><html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Administración · Zambomba</title><style>body{font:16px system-ui;background:#17110f;color:#fff4e8;max-width:900px;margin:40px auto;padding:20px}section{background:#281d19;padding:20px;border-radius:12px;margin:16px 0}input,button{padding:12px;border-radius:8px;font:inherit}button{cursor:pointer;background:#d5a45d;border:0}input{background:#100d0b;color:white;border:1px solid #76543e}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid #604638}</style><h1>Panel de administración</h1><section id="login"><input id="pw" type="password" placeholder="Contraseña de administración"><button onclick="login()">Entrar</button></section><section id="data" hidden><div id="summary"></div><h2>Pedidos</h2><div id="orders"></div></section><script>
+async function login(){const r=await fetch("/api/admin/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:document.querySelector("#pw").value})});if(!r.ok)return alert("Contraseña incorrecta o panel no configurado");document.querySelector("#login").hidden=true;document.querySelector("#data").hidden=false;load()}
+async function load(){const [s,o]=await Promise.all([fetch("/api/admin/summary"),fetch("/api/admin/orders")]);if(!s.ok)return;const d=await s.json(),rows=await o.json();document.querySelector("#summary").innerHTML="<b>Aforo:</b> "+d.sold+" vendidas · "+d.pending+" reservadas · "+d.available+" disponibles · <b>Ingresos:</b> "+d.revenue+" €";document.querySelector("#orders").innerHTML="<table><tr><th>Pedido</th><th>Cliente</th><th>Entradas</th><th>Estado</th><th>Acción</th></tr>"+rows.map(x=>"<tr><td>"+x.id+"</td><td>"+x.name+"<br>"+x.email+"</td><td>"+x.quantity+"</td><td>"+x.status+"</td><td>"+(x.status==="declared"?"<button onclick=\"act('"+x.id+"','confirm')\">Confirmar pago</button> <button onclick=\"act('"+x.id+"','reject')\">Rechazar</button>":"—")+"</td></tr>").join("")+"</table>"}
+async function act(id,a){if(a==="confirm"&&!confirm("¿Has comprobado el Bizum en tu banco?"))return;const r=await fetch("/api/admin/orders/"+id+"/"+a,{method:"POST"});const d=await r.json();alert(d.error||"Operación realizada. Correo: "+(d.email?.sent?"enviado":"pendiente de configurar"));load()}
+</script></html>`));
+app.post("/api/orders",(req,res)=>{
+ const {name,email,phone,quantity}=req.body||{}, q=Number(quantity);
+ if(!String(name||"").trim()||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email||"")||!Number.isInteger(q)||q<1||q>10)return res.status(400).json({error:"Revisa nombre, correo y cantidad (1 a 10)."});
+ const create=db.transaction(()=>{const t=totals();if(q>t.available)throw Error("No quedan suficientes entradas.");const id=makeId();db.prepare("INSERT INTO orders(id,name,email,phone,quantity,total_cents,status,created_at) VALUES(?,?,?,?,?,?,?,?)").run(id,name.trim(),email.trim(),String(phone||"").trim(),q,q*PRICE,"pending",now());return id;});
+ try{const id=create();res.json({id,total:q*PRICE/100,instructions:process.env.BIZUM_INSTRUCTIONS||"La organización te facilitará las instrucciones de Bizum. No realices ningún pago hasta recibirlas."});}catch(e){res.status(409).json({error:e.message})}
+});
+app.post("/api/orders/:id/declare",(req,res)=>{const r=db.prepare("UPDATE orders SET status='declared',declared_at=? WHERE id=? AND status='pending'").run(now(),req.params.id);if(!r.changes)return res.status(400).json({error:"No se puede declarar este pedido."});res.json({ok:true,message:"Aviso recibido. El pago sigue pendiente de comprobación manual."})});
+const admin=(req,res,next)=>req.session.admin?next():res.status(401).json({error:"No autorizado"});
+app.post("/api/admin/login",(req,res)=>{if(!ADMIN_HASH)return res.status(503).json({error:"Panel sin configurar"});if(!bcrypt.compareSync(String(req.body.password||""),ADMIN_HASH))return res.status(401).json({error:"Contraseña incorrecta"});req.session.admin=true;res.json({ok:true})});
+app.get("/api/admin/summary",admin,(req,res)=>{const t=totals(),revenue=db.prepare("SELECT COALESCE(SUM(total_cents),0) n FROM orders WHERE status='confirmed'").get().n;res.json({...t,capacity:CAPACITY,revenue:revenue/100})});
+app.get("/api/admin/orders",admin,(req,res)=>res.json(db.prepare("SELECT id,name,email,quantity,status,created_at FROM orders ORDER BY created_at DESC").all()));
+app.post("/api/admin/orders/:id/confirm",admin,(req,res)=>{const confirm=db.transaction(()=>{const o=db.prepare("SELECT * FROM orders WHERE id=?").get(req.params.id);if(!o||o.status!=="declared")throw Error("Pedido no pendiente.");const online=db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM orders WHERE status='confirmed'").get().n,manual=db.prepare("SELECT COALESCE(SUM(quantity),0) n FROM manual_sales").get().n;if(o.quantity>CAPACITY-online-manual)throw Error("Aforo insuficiente.");const tokens=Array.from({length:o.quantity},()=>crypto.randomBytes(18).toString("hex"));db.prepare("UPDATE orders SET status='confirmed',confirmed_at=?,qr_tokens=? WHERE id=?").run(now(),JSON.stringify(tokens),o.id);return tokens;});try{const tokens=confirm();res.json({ok:true,tickets:tokens.map(t=>({token:t,qr:"/ticket/"+t}))})}catch(e){res.status(409).json({error:e.message})}});
+app.post("/api/admin/orders/:id/reject",admin,(req,res)=>{const r=db.prepare("UPDATE orders SET status='rejected' WHERE id=? AND status='declared'").run(req.params.id);if(!r.changes)return res.status(400).json({error:"No se puede rechazar."});res.json({ok:true})});
+app.get("/ticket/:token",async(req,res)=>{const o=db.prepare("SELECT * FROM orders WHERE status='confirmed'").all().find(x=>(JSON.parse(x.qr_tokens||"[]")).includes(req.params.token));if(!o)return res.status(404).send("Entrada no válida.");const scan=db.prepare("SELECT token FROM scans WHERE token=?").get(req.params.token);if(scan)return res.status(409).send("Entrada ya utilizada.");const png=await QRCode.toDataURL(req.protocol+"://"+req.get("host")+"/check/"+req.params.token);res.type("html").send("<h1>Entrada Zambomba Flamenca Ronda</h1><p>"+o.name+"</p><img src='"+png+"' width='260'><p>Presenta este QR en el acceso.</p>")});
+app.get("/check/:token",(req,res)=>{const o=db.prepare("SELECT * FROM orders WHERE status='confirmed'").all().find(x=>(JSON.parse(x.qr_tokens||"[]")).includes(req.params.token));if(!o)return res.status(404).send("Entrada no válida.");res.type("html").send("<h1>QR reconocido</h1><p>La validación final debe realizarla el personal de acceso desde un dispositivo autorizado.</p>")});
+app.get("/health",(req,res)=>res.json({ok:true}));
+const port=Number(process.env.PORT||3000);
+app.listen(port,"0.0.0.0",()=>console.log("Zambomba online en puerto "+port));
