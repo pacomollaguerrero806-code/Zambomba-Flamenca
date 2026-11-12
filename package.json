@@ -2,7 +2,7 @@
   "name": "zambomba-flamenca-ronda",
   "version": "1.0.0",
   "private": true,
-  "description": "Venta y gestión de entradas para Zambomba Flamenca Ronda",
+  "description": "Venta y gestión de entradas para Zambomba Flamenca Ronda con notificaciones push",
   "scripts": {
     "start": "node server.js"
   },
